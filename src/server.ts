@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Chat endpoint
-const chatHandler: RequestHandler = async (req, res) => {
+export const chatHandler: RequestHandler = async (req, res) => {
   try {
     const { message } = req.body;
     
