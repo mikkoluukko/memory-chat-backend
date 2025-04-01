@@ -1,5 +1,14 @@
 import request from 'supertest';
 import express from 'express';
+
+// Mock HuggingFace inference
+const mockTextGeneration = jest.fn().mockResolvedValue({ generated_text: 'Test AI response' });
+jest.mock('@huggingface/inference', () => ({
+  HfInference: jest.fn().mockImplementation(() => ({
+    textGeneration: mockTextGeneration
+  }))
+}));
+
 import { HfInference } from '@huggingface/inference';
 import { chatHandler } from '../server';
 
@@ -8,6 +17,10 @@ app.use(express.json());
 app.post('/api/chat/message', chatHandler);
 
 describe('Chat API', () => {
+  beforeEach(() => {
+    mockTextGeneration.mockClear();
+  });
+
   it('should return 400 if message is missing', async () => {
     const response = await request(app)
       .post('/api/chat/message')
@@ -27,10 +40,7 @@ describe('Chat API', () => {
   });
 
   it('should handle API errors gracefully', async () => {
-    // Mock API error
-    (HfInference as jest.Mock).mockImplementationOnce(() => ({
-      textGeneration: jest.fn().mockRejectedValue(new Error('API Error'))
-    }));
+    mockTextGeneration.mockRejectedValueOnce(new Error('API Error'));
 
     const response = await request(app)
       .post('/api/chat/message')

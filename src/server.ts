@@ -5,7 +5,7 @@ import { HfInference } from '@huggingface/inference';
 
 dotenv.config();
 
-const app = express();
+export const app = express();
 const port = process.env.PORT || 3001;
 
 // Initialize HuggingFace client
@@ -43,6 +43,9 @@ export const chatHandler: RequestHandler = async (req, res) => {
 
 app.post('/api/chat/message', chatHandler);
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-}); 
+// Only start the server if we're not in a test environment
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+} 
