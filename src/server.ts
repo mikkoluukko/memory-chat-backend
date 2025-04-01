@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, RequestHandler } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { HfInference } from '@huggingface/inference';
@@ -15,12 +15,13 @@ app.use(cors());
 app.use(express.json());
 
 // Chat endpoint
-app.post('/api/chat/message', async (req, res) => {
+const chatHandler: RequestHandler = async (req, res) => {
   try {
     const { message } = req.body;
     
     if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
+      res.status(400).json({ error: 'Message is required' });
+      return;
     }
 
     const response = await hf.textGeneration({
@@ -38,7 +39,9 @@ app.post('/api/chat/message', async (req, res) => {
     console.error('Error:', error);
     res.status(500).json({ error: 'Failed to generate response' });
   }
-});
+};
+
+app.post('/api/chat/message', chatHandler);
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
