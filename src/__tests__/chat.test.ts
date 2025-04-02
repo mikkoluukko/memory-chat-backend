@@ -1,50 +1,91 @@
 import request from 'supertest';
-import express from 'express';
+import { HfInference } from '@huggingface/inference';
+import { app } from '../server';
+import { supabase } from '../lib/supabase';
 
-// Mock HuggingFace inference
-const mockTextGeneration = jest.fn().mockResolvedValue({ generated_text: 'Test AI response' });
-jest.mock('@huggingface/inference', () => ({
-  HfInference: jest.fn().mockImplementation(() => ({
-    textGeneration: mockTextGeneration
-  }))
+jest.mock('@huggingface/inference');
+jest.mock('../lib/supabase', () => ({
+  supabase: {
+    from: jest.fn().mockReturnThis(),
+    select: jest.fn().mockReturnThis(),
+    eq: jest.fn().mockReturnThis(),
+    order: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    insert: jest.fn().mockReturnThis(),
+    single: jest.fn(),
+  },
 }));
 
-import { HfInference } from '@huggingface/inference';
-import { chatHandler } from '../server';
-
-const app = express();
-app.use(express.json());
-app.post('/api/chat/message', chatHandler);
-
 describe('Chat API', () => {
+  const mockTextGeneration = jest.fn();
+  const mockUserId = 'test-user-123';
+  const mockMessage = {
+    id: '1',
+    userId: mockUserId,
+    role: 'user',
+    content: 'Hello',
+    timestamp: '2024-01-01T00:00:00Z',
+  };
+
   beforeEach(() => {
-    mockTextGeneration.mockClear();
+    jest.clearAllMocks();
+    (HfInference as jest.Mock).mockImplementation(() => ({
+      textGeneration: mockTextGeneration,
+    }));
+    mockTextGeneration.mockResolvedValue({ generated_text: 'Test AI response' });
+
+    // Mock Supabase responses
+    (supabase.from as jest.Mock).mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      eq: jest.fn().mockReturnThis(),
+      order: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockResolvedValue({ data: [], error: null }),
+      insert: jest.fn().mockReturnThis(),
+      single: jest.fn().mockResolvedValue({ data: mockMessage, error: null }),
+    });
   });
 
-  it('should return 400 if message is missing', async () => {
+  it('should return error for missing message', async () => {
     const response = await request(app)
       .post('/api/chat/message')
-      .send({});
+      .send({ userId: mockUserId });
 
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: 'Message is required' });
   });
 
+  it('should return error for missing userId', async () => {
+    const response = await request(app)
+      .post('/api/chat/message')
+      .send({ message: 'Hello' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'User ID is required' });
+  });
+
   it('should return AI response for valid message', async () => {
     const response = await request(app)
       .post('/api/chat/message')
-      .send({ message: 'Hello, how are you?' });
+      .send({ message: 'Hello, how are you?', userId: mockUserId });
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ response: 'Test AI response' });
   });
 
   it('should handle API errors gracefully', async () => {
-    mockTextGeneration.mockRejectedValueOnce(new Error('API Error'));
+    mockTextGeneration.mockRejectedValue(new Error('API Error'));
+    (supabase.from as jest.Mock).mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      eq: jest.fn().mockReturnThis(),
+      order: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockResolvedValue({ data: [], error: null }),
+      insert: jest.fn().mockReturnThis(),
+      single: jest.fn().mockRejectedValue(new Error('Database error')),
+    });
 
     const response = await request(app)
       .post('/api/chat/message')
-      .send({ message: 'Hello' });
+      .send({ message: 'Hello', userId: mockUserId });
 
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: 'Failed to generate response' });
