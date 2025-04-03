@@ -9,7 +9,12 @@ if (!process.env.SUPABASE_ANON_KEY) {
   throw new Error('Missing SUPABASE_ANON_KEY environment variable');
 }
 
-export const supabase = createClient<Database>(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-); 
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+export const supabase = createClient<Database>(supabaseUrl, supabaseKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: false,
+  },
+}); 

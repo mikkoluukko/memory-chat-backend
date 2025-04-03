@@ -2,7 +2,7 @@ export type MessageRole = 'user' | 'bot';
 
 export interface Message {
   id: string;
-  userId: string;
+  user_id: string;
   role: MessageRole;
   content: string;
   timestamp: string;
