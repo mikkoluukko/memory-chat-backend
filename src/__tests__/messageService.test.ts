@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase';
 import { getRecentMessages, saveMessage, buildPromptWithHistory } from '../services/messageService';
+import type { Message } from '../types/database';
 
 // Mock Supabase client
 jest.mock('../lib/supabase', () => ({
@@ -16,10 +17,10 @@ jest.mock('../lib/supabase', () => ({
 
 describe('Message Service', () => {
   const mockUserId = 'test-user-123';
-  const mockMessage = {
+  const mockMessage: Message = {
     id: '1',
-    userId: mockUserId,
-    role: 'user' as const,
+    user_id: mockUserId,
+    role: 'user',
     content: 'Hello',
     timestamp: '2024-01-01T00:00:00Z',
   };
@@ -94,14 +95,29 @@ describe('Message Service', () => {
 
   describe('buildPromptWithHistory', () => {
     it('should build prompt with message history', () => {
-      const messages = [
-        { ...mockMessage, role: 'user' as const, content: 'Hello' },
-        { ...mockMessage, role: 'bot' as const, content: 'Hi there!' },
+      const messages: Message[] = [
+        { ...mockMessage, role: 'user', content: 'Hello' },
+        { ...mockMessage, role: 'bot', content: 'Hi there!' },
       ];
       const newMessage = 'How are you?';
 
       const prompt = buildPromptWithHistory(messages, newMessage);
-      expect(prompt).toBe('<s>Hi there!\n[INST] Hello [/INST][INST] How are you? [/INST]');
+      
+      // Check that it starts with the system message
+      expect(prompt).toContain('[INST] You are a helpful AI assistant. Be concise and clear in your responses. [/INST]');
+      
+      // Check that it contains user message with INST tags
+      expect(prompt).toContain('[INST] Hello [/INST]');
+      
+      // Check that it contains bot message without INST tags
+      expect(prompt).toContain('Hi there!');
+      
+      // Check that it ends with the new message
+      expect(prompt).toContain(`[INST] ${newMessage} [/INST]`);
+      
+      // Verify the complete expected structure
+      const expectedPrompt = '<s>[INST] You are a helpful AI assistant. Be concise and clear in your responses. [/INST]\n\n[INST] Hello [/INST]\nHi there!\n\n[INST] How are you? [/INST]';
+      expect(prompt).toBe(expectedPrompt);
     });
   });
 }); 
