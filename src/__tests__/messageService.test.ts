@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase';
 import { getRecentMessages, saveMessage, buildPromptWithHistory } from '../services/messageService';
+import { getPersonalityDescription } from '../services/personalityService';
 import type { Message } from '../types/database';
 
 // Mock Supabase client
@@ -13,6 +14,11 @@ jest.mock('../lib/supabase', () => ({
     insert: jest.fn().mockReturnThis(),
     single: jest.fn(),
   },
+}));
+
+// Mock personalityService
+jest.mock('../services/personalityService', () => ({
+  getPersonalityDescription: jest.fn().mockResolvedValue('You are a helpful AI assistant. Be concise and clear in your responses.'),
 }));
 
 describe('Message Service', () => {
@@ -94,14 +100,14 @@ describe('Message Service', () => {
   });
 
   describe('buildPromptWithHistory', () => {
-    it('should build prompt with message history', () => {
+    it('should build prompt with message history', async () => {
       const messages: Message[] = [
         { ...mockMessage, role: 'user', content: 'Hello' },
         { ...mockMessage, role: 'bot', content: 'Hi there!' },
       ];
       const newMessage = 'How are you?';
 
-      const prompt = buildPromptWithHistory(messages, newMessage);
+      const prompt = await buildPromptWithHistory(mockUserId, messages, newMessage);
       
       // Check that it starts with the system message
       expect(prompt).toContain('[INST] You are a helpful AI assistant. Be concise and clear in your responses. [/INST]');

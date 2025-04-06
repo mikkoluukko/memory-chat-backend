@@ -2,6 +2,8 @@ import request from 'supertest';
 import { HfInference } from '@huggingface/inference';
 import { app } from '../server';
 import { supabase } from '../lib/supabase';
+import * as messageService from '../services/messageService';
+import * as personalityService from '../services/personalityService';
 
 jest.mock('@huggingface/inference');
 jest.mock('../lib/supabase', () => ({
@@ -16,16 +18,37 @@ jest.mock('../lib/supabase', () => ({
   },
 }));
 
+// Mock messageService and personalityService
+jest.mock('../services/messageService', () => ({
+  getRecentMessages: jest.fn().mockResolvedValue([]),
+  saveMessage: jest.fn().mockImplementation((userId, content, role) => 
+    Promise.resolve({
+      id: '1',
+      user_id: userId,
+      role,
+      content,
+      timestamp: '2024-01-01T00:00:00Z',
+    })
+  ),
+  buildPromptWithHistory: jest.fn().mockResolvedValue('<s>[INST] Test system prompt [/INST]\n\n[INST] Hello, how are you? [/INST]'),
+  getMemorySummary: jest.fn().mockResolvedValue(null),
+}));
+
+jest.mock('../services/personalityService', () => ({
+  getPersonalityDescription: jest.fn().mockResolvedValue('You are a helpful AI assistant.'),
+  getPersonality: jest.fn().mockResolvedValue(null),
+  savePersonality: jest.fn().mockResolvedValue({
+    id: '1',
+    user_id: 'test-user-123',
+    description: 'Test personality',
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+  }),
+}));
+
 describe('Chat API', () => {
   const mockTextGeneration = jest.fn();
   const mockUserId = 'test-user-123';
-  const mockMessage = {
-    id: '1',
-    userId: mockUserId,
-    role: 'user',
-    content: 'Hello',
-    timestamp: '2024-01-01T00:00:00Z',
-  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -33,16 +56,6 @@ describe('Chat API', () => {
       textGeneration: mockTextGeneration,
     }));
     mockTextGeneration.mockResolvedValue({ generated_text: 'Test AI response' });
-
-    // Mock Supabase responses
-    (supabase.from as jest.Mock).mockReturnValue({
-      select: jest.fn().mockReturnThis(),
-      eq: jest.fn().mockReturnThis(),
-      order: jest.fn().mockReturnThis(),
-      limit: jest.fn().mockResolvedValue({ data: [], error: null }),
-      insert: jest.fn().mockReturnThis(),
-      single: jest.fn().mockResolvedValue({ data: mockMessage, error: null }),
-    });
   });
 
   it('should return error for missing message', async () => {
@@ -73,15 +86,8 @@ describe('Chat API', () => {
   });
 
   it('should handle API errors gracefully', async () => {
-    mockTextGeneration.mockRejectedValue(new Error('API Error'));
-    (supabase.from as jest.Mock).mockReturnValue({
-      select: jest.fn().mockReturnThis(),
-      eq: jest.fn().mockReturnThis(),
-      order: jest.fn().mockReturnThis(),
-      limit: jest.fn().mockResolvedValue({ data: [], error: null }),
-      insert: jest.fn().mockReturnThis(),
-      single: jest.fn().mockRejectedValue(new Error('Database error')),
-    });
+    // Override the mockImplementation to throw an error
+    (messageService.saveMessage as jest.Mock).mockRejectedValueOnce(new Error('Failed to save message'));
 
     const response = await request(app)
       .post('/api/chat/message')

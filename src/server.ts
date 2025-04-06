@@ -4,7 +4,16 @@ dotenv.config();
 import express, { Request, Response, RequestHandler } from 'express';
 import cors from 'cors';
 import { HfInference } from '@huggingface/inference';
-import { getRecentMessages, saveMessage, buildPromptWithHistory } from './services/messageService';
+import { 
+  getRecentMessages, 
+  saveMessage, 
+  buildPromptWithHistory, 
+  getMemorySummary 
+} from './services/messageService';
+import { 
+  getPersonality, 
+  savePersonality 
+} from './services/personalityService';
 
 export const app = express();
 const port = process.env.PORT || 3001;
@@ -72,9 +81,12 @@ export const chatHandler: RequestHandler = async (req, res) => {
 
     // Get conversation history
     const history = await getRecentMessages(userId);
-
-    // Build prompt with history
-    const prompt = buildPromptWithHistory(history, message);
+    
+    // Get memory summary if available
+    const memorySummary = await getMemorySummary(userId);
+    
+    // Build prompt with history, memory summary, and custom personality
+    const prompt = await buildPromptWithHistory(userId, history, message, memorySummary?.content);
 
     // Get AI response
     const response = await hf.textGeneration({
@@ -100,7 +112,57 @@ export const chatHandler: RequestHandler = async (req, res) => {
   }
 };
 
+// Get personality endpoint
+export const getPersonalityHandler: RequestHandler = async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId || typeof userId !== 'string') {
+      res.status(400).json({ error: 'User ID is required as a query parameter' });
+      return;
+    }
+
+    const personality = await getPersonality(userId);
+    
+    if (personality) {
+      res.json({ personality });
+    } else {
+      res.json({ personality: null });
+    }
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to fetch personality' });
+  }
+};
+
+// Save personality endpoint
+export const savePersonalityHandler: RequestHandler = async (req, res) => {
+  try {
+    const { userId, description } = req.body;
+    
+    if (!userId) {
+      res.status(400).json({ error: 'User ID is required' });
+      return;
+    }
+
+    if (!description) {
+      res.status(400).json({ error: 'Personality description is required' });
+      return;
+    }
+
+    const personality = await savePersonality(userId, description);
+    
+    res.json({ personality });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to save personality' });
+  }
+};
+
+// Register routes
 app.post('/api/chat/message', chatHandler);
+app.get('/api/personality', getPersonalityHandler);
+app.post('/api/personality', savePersonalityHandler);
 
 // Only start the server if we're not in a test environment
 if (process.env.NODE_ENV !== 'test') {
