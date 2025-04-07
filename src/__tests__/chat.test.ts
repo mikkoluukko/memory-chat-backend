@@ -1,68 +1,62 @@
+// Define mocks FIRST
+const mockSendMessage = jest.fn();
+const mockStartChat = jest.fn(() => ({ sendMessage: mockSendMessage }));
+const mockGetGenerativeModel = jest.fn(() => ({ startChat: mockStartChat }));
+
+// Mock GoogleGenerativeAI BEFORE other imports
+jest.mock('@google/generative-ai', () => ({
+  GoogleGenerativeAI: jest.fn().mockImplementation(() => ({
+    getGenerativeModel: mockGetGenerativeModel,
+  })),
+  HarmCategory: {},
+  HarmBlockThreshold: {},
+}));
+
+// Now import other modules
 import request from 'supertest';
-import { HfInference } from '@huggingface/inference';
-import { app } from '../server';
-import { supabase } from '../lib/supabase';
+import { app } from '../server'; // This imports server.ts, which imports messageService.ts
 import * as messageService from '../services/messageService';
 import * as personalityService from '../services/personalityService';
+// GoogleGenerativeAI is already mocked, no need to import it directly here
 
-jest.mock('@huggingface/inference');
-jest.mock('../lib/supabase', () => ({
-  supabase: {
-    from: jest.fn().mockReturnThis(),
-    select: jest.fn().mockReturnThis(),
-    eq: jest.fn().mockReturnThis(),
-    order: jest.fn().mockReturnThis(),
-    limit: jest.fn().mockReturnThis(),
-    insert: jest.fn().mockReturnThis(),
-    single: jest.fn(),
-  },
-}));
-
-// Mock messageService and personalityService
-jest.mock('../services/messageService', () => ({
-  getRecentMessages: jest.fn().mockResolvedValue([]),
-  saveMessage: jest.fn().mockImplementation((userId, content, role) => 
-    Promise.resolve({
-      id: '1',
-      user_id: userId,
-      role,
-      content,
-      timestamp: '2024-01-01T00:00:00Z',
-    })
-  ),
-  buildPromptWithHistory: jest.fn().mockResolvedValue('<s>[INST] Test system prompt [/INST]\n\n[INST] Hello, how are you? [/INST]'),
-  getMemorySummary: jest.fn().mockResolvedValue(null),
-}));
-
-jest.mock('../services/personalityService', () => ({
-  getPersonalityDescription: jest.fn().mockResolvedValue('You are a helpful AI assistant.'),
-  getPersonality: jest.fn().mockResolvedValue(null),
-  savePersonality: jest.fn().mockResolvedValue({
-    id: '1',
-    user_id: 'test-user-123',
-    description: 'Test personality',
-    created_at: '2024-01-01T00:00:00Z',
-    updated_at: '2024-01-01T00:00:00Z',
-  }),
-}));
+// Mock the services AFTER other imports but before describe block
+jest.mock('../services/messageService');
+jest.mock('../services/personalityService');
 
 describe('Chat API', () => {
-  const mockTextGeneration = jest.fn();
   const mockUserId = 'test-user-123';
 
   beforeEach(() => {
     jest.clearAllMocks();
-    (HfInference as jest.Mock).mockImplementation(() => ({
-      textGeneration: mockTextGeneration,
-    }));
-    mockTextGeneration.mockResolvedValue({ generated_text: 'Test AI response' });
+    // Clear the globally defined mocks
+    mockSendMessage.mockClear(); 
+    mockStartChat.mockClear();
+    mockGetGenerativeModel.mockClear();
+
+    // Reset service mocks
+    (messageService.saveMessage as jest.Mock).mockResolvedValue({ id: 'msg1', content: 'saved', role: 'user' });
+    (messageService.getRecentMessages as jest.Mock).mockResolvedValue([
+        { id: 'hist1', content: 'History 1', role: 'user', timestamp: new Date().toISOString() },
+        { id: 'hist2', content: 'History 2', role: 'model', timestamp: new Date().toISOString() },
+    ]);
+    (messageService.buildPromptWithHistory as jest.Mock).mockResolvedValue([
+        { role: 'user', parts: [{ text: 'System Prompt' }] }, 
+        { role: 'model', parts: [{ text: 'Ack' }] },
+        { role: 'user', parts: [{ text: 'History 1' }] },
+        { role: 'model', parts: [{ text: 'History 2' }] },
+        { role: 'user', parts: [{ text: 'Hello' }] },
+    ]);
+
+    // Reset Gemini mock default behavior
+    mockSendMessage.mockResolvedValue({ 
+        response: { text: () => 'Test AI response' } 
+    });
   });
 
   it('should return error for missing message', async () => {
     const response = await request(app)
       .post('/api/chat/message')
       .send({ userId: mockUserId });
-
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: 'Message is required' });
   });
@@ -71,23 +65,39 @@ describe('Chat API', () => {
     const response = await request(app)
       .post('/api/chat/message')
       .send({ message: 'Hello' });
-
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: 'User ID is required' });
   });
 
   it('should return AI response for valid message', async () => {
+    const userMessage = 'Hello, how are you?';
+    const aiResponse = 'Test AI response';
+    
+    mockSendMessage.mockResolvedValueOnce({ 
+        response: { text: () => aiResponse } 
+    });
+
     const response = await request(app)
       .post('/api/chat/message')
-      .send({ message: 'Hello, how are you?', userId: mockUserId });
+      .send({ message: userMessage, userId: mockUserId });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ response: 'Test AI response' });
+    expect(response.body).toEqual({ response: aiResponse });
+
+    // Assertions using the directly accessible mock functions
+    expect(messageService.saveMessage).toHaveBeenCalledTimes(2);
+    expect(messageService.saveMessage).toHaveBeenCalledWith(mockUserId, userMessage, 'user');
+    expect(messageService.getRecentMessages).toHaveBeenCalledWith(mockUserId);
+    expect(messageService.buildPromptWithHistory).toHaveBeenCalledWith(mockUserId, expect.any(Array), userMessage);
+    expect(mockGetGenerativeModel).toHaveBeenCalled(); 
+    expect(mockStartChat).toHaveBeenCalledWith({ history: expect.any(Array) }); 
+    expect(mockSendMessage).toHaveBeenCalledWith(userMessage);
+    expect(messageService.saveMessage).toHaveBeenCalledWith(mockUserId, aiResponse, 'model');
   });
 
-  it('should handle API errors gracefully', async () => {
-    // Override the mockImplementation to throw an error
-    (messageService.saveMessage as jest.Mock).mockRejectedValueOnce(new Error('Failed to save message'));
+  it('should handle Gemini API errors gracefully', async () => {
+    const apiError = new Error('Gemini API Error');
+    mockSendMessage.mockRejectedValueOnce(apiError);
 
     const response = await request(app)
       .post('/api/chat/message')
@@ -95,5 +105,22 @@ describe('Chat API', () => {
 
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: 'Failed to generate response' });
+    expect(messageService.saveMessage).toHaveBeenCalledTimes(1); 
+    expect(messageService.saveMessage).toHaveBeenCalledWith(mockUserId, 'Hello', 'user');
+    expect(mockSendMessage).toHaveBeenCalled(); // Gemini was called, but failed
+    expect(messageService.saveMessage).not.toHaveBeenCalledWith(mockUserId, expect.any(String), 'model');
+  });
+
+  it('should handle database errors during user message save gracefully', async () => {
+    const dbError = new Error('Database save error');
+    (messageService.saveMessage as jest.Mock).mockRejectedValueOnce(dbError);
+
+    const response = await request(app)
+      .post('/api/chat/message')
+      .send({ message: 'Hello', userId: mockUserId });
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'Failed to generate response' });
+    expect(mockSendMessage).not.toHaveBeenCalled(); // Gemini should not be called if DB save fails first
   });
 }); 

@@ -1,4 +1,7 @@
-export type MessageRole = 'user' | 'bot';
+// Helper type to get the Table type from the Database definition
+export type Tables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T]['Row'];
+
+export type MessageRole = 'user' | 'model';
 
 export interface Message {
   id: string;

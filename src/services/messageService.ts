@@ -1,31 +1,214 @@
 import { supabase } from '../lib/supabase';
-import type { Message, MessageRole, MemorySummary } from '../types/database';
-import { HfInference } from '@huggingface/inference';
-import { cleanModelResponse } from '../server';
+import type { Database, Tables } from '../types/database';
 import { getPersonalityDescription } from './personalityService';
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold, Content } from '@google/generative-ai';
 
-const HISTORY_LIMIT = 10;
-const SUMMARIZE_THRESHOLD = 10; // Number of messages before we should summarize
+type Message = Tables<'messages'>;
+type MemorySummary = Tables<'memory_summary'>;
 
-// Initialize HuggingFace client for summarization
-const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
+const MAX_RECENT_MESSAGES = 10; // Max messages to fetch for recent history
+const MAX_MESSAGES_FOR_SUMMARY = 50; // Messages to consider for summarization
+const SUMMARY_THRESHOLD = 40; // Trigger summary if message count exceeds this
 
-// Fallback character personality definition (used only if custom personality and default both fail)
-const FALLBACK_SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise and clear in your responses.";
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
+const model = genAI.getGenerativeModel({
+  model: 'gemini-1.5-flash',
+  // Ensure safety settings are appropriate
+  safetySettings: [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+  ]
+});
+
+/**
+ * Fetches recent messages for a specific user.
+ */
 export async function getRecentMessages(userId: string): Promise<Message[]> {
   const { data, error } = await supabase
     .from('messages')
     .select('*')
     .eq('user_id', userId)
     .order('timestamp', { ascending: true })
-    .limit(HISTORY_LIMIT);
+    .limit(MAX_RECENT_MESSAGES);
 
   if (error) {
-    throw new Error(`Failed to fetch messages: ${error.message}`);
+    console.error('Error fetching messages:', error);
+    throw new Error('Failed to fetch messages');
+  }
+  return data || [];
+}
+
+/**
+ * Saves a message to the database.
+ */
+export async function saveMessage(userId: string, content: string, role: 'user' | 'model'): Promise<Message> {
+  const { data, error } = await supabase
+    .from('messages')
+    .insert({ user_id: userId, content, role })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Error saving message:', error);
+    throw new Error('Failed to save message');
   }
 
-  return data || [];
+  // Trigger memory summarization check in the background (fire and forget)
+  checkAndSummarizeMemory(userId).catch(err => console.error("Background summarization failed:", err));
+
+  return data;
+}
+
+/**
+ * Fetches the latest memory summary for a user.
+ */
+export async function getMemorySummary(userId: string): Promise<MemorySummary | null> {
+  const { data, error } = await supabase
+    .from('memory_summary')
+    .select('*')
+    .eq('user_id', userId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .single(); // Fetch only the latest summary
+
+  if (error && error.code !== 'PGRST116') { // Ignore 'range not found' error
+    console.error('Error fetching memory summary:', error);
+    // Don't throw, just return null if fetch fails
+  }
+  return data || null;
+}
+
+
+/**
+ * Builds a conversation history suitable for the Gemini API.
+ */
+export async function buildPromptWithHistory(userId: string, messages: Message[], newMessage: string): Promise<Content[]> {
+  const systemInstruction = await getPersonalityDescription(userId);
+  const memorySummary = await getMemorySummary(userId);
+
+  const history: Content[] = [];
+
+  // Add system instruction
+  history.push({
+      role: "user", // System instructions are often put in the first 'user' turn
+      parts: [{ text: `System Prompt: ${systemInstruction}` }]
+  });
+  history.push({
+      role: "model",
+      parts: [{ text: "Understood. I will act according to this personality." }] // Simple ack from model
+  });
+
+
+  // Add memory summary if it exists
+  if (memorySummary?.content) {
+      history.push({
+          role: "user",
+          parts: [{ text: `Previous Conversation Summary: ${memorySummary.content}` }]
+      });
+      history.push({
+          role: "model",
+          parts: [{ text: "Okay, I have reviewed the summary of our previous conversation." }]
+      });
+  }
+
+  // Add recent messages
+  messages.forEach(msg => {
+    history.push({
+      role: msg.role === 'user' ? 'user' : 'model', // Map role directly
+      parts: [{ text: msg.content }]
+    });
+  });
+
+  // Add the new user message
+  history.push({
+    role: 'user',
+    parts: [{ text: newMessage }]
+  });
+
+  return history;
+}
+
+
+/**
+ * Generates a concise summary of the provided messages using Gemini.
+ */
+export async function generateMemorySummary(messages: Message[]): Promise<string> {
+  const conversationText = messages.map(msg => `${msg.role}: ${msg.content}`).join('\n');
+  const prompt = `Summarize the key points and topics discussed in the following conversation. Be concise and focus on information that would be useful context for future interactions. Conversation:\n\n${conversationText}\n\nSummary:`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const response = result.response;
+    const summary = response.text();
+    return summary.trim();
+  } catch (error) {
+    console.error('Error generating memory summary with Gemini:', error);
+    throw new Error('Failed to generate memory summary');
+  }
+}
+
+/**
+ * Saves or updates the memory summary for a user.
+ */
+async function saveMemorySummaryInternal(userId: string, summary: string): Promise<void> {
+  const { error } = await supabase
+    .from('memory_summary')
+    .upsert({ user_id: userId, content: summary, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+
+  if (error) {
+    console.error('Error saving memory summary:', error);
+    throw new Error('Failed to save memory summary');
+  }
+}
+
+/**
+ * Checks if memory summarization is needed and performs it.
+ * Fetches more messages than needed for context to decide if summarization should occur.
+ */
+async function checkAndSummarizeMemory(userId: string): Promise<void> {
+  try {
+    // Fetch a larger chunk of messages to decide if summarization is needed
+    const { data: messages, error } = await supabase
+      .from('messages')
+      .select('id, role, content, timestamp') // Select only needed fields
+      .eq('user_id', userId)
+      .order('timestamp', { ascending: false }) // Get latest messages first
+      .limit(MAX_MESSAGES_FOR_SUMMARY);
+
+    if (error) {
+      console.error('Error fetching messages for summarization check:', error);
+      return; // Don't proceed if messages can't be fetched
+    }
+
+    if (!messages || messages.length < SUMMARY_THRESHOLD) {
+      // Not enough messages to trigger summarization yet
+      return;
+    }
+
+    // We have enough messages, generate and save a summary
+    console.log(`Generating memory summary for user ${userId}...`);
+    // Ensure the message objects passed to generateMemorySummary match the Message type
+    const validMessages: Message[] = messages.map(msg => ({ 
+      ...msg, 
+      user_id: userId // Explicitly add user_id if it was missing from select
+    }));
+    const summary = await generateMemorySummary(validMessages.reverse());
+    await saveMemorySummaryInternal(userId, summary);
+    console.log(`Memory summary saved for user ${userId}.`);
+
+    // Optional: Consider deleting older messages that are now summarized,
+    // but be careful about data retention policies and potential issues.
+    // Example (use with caution):
+    // const oldestMessageTimestamp = messages[messages.length - 1].timestamp;
+    // await supabase.from('messages').delete().eq('user_id', userId).lt('timestamp', oldestMessageTimestamp);
+
+  } catch (error) {
+    console.error('Error in checkAndSummarizeMemory:', error);
+    // Don't throw here - this is a background operation that shouldn't break the main flow
+  }
 }
 
 export async function getAllMessages(userId: string): Promise<Message[]> {
@@ -40,221 +223,6 @@ export async function getAllMessages(userId: string): Promise<Message[]> {
   }
 
   return data || [];
-}
-
-export async function saveMessage(
-  userId: string,
-  content: string,
-  role: MessageRole
-): Promise<Message> {
-  const { data, error } = await supabase
-    .from('messages')
-    .insert([
-      {
-        user_id: userId,
-        content,
-        role,
-      },
-    ])
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to save message: ${error.message}`);
-  }
-
-  // After saving a message, check if we need to summarize old messages
-  if (role === 'user') {
-    await checkAndSummarizeMemory(userId);
-  }
-
-  return data;
-}
-
-export async function getMemorySummary(userId: string): Promise<MemorySummary | null> {
-  const { data, error } = await supabase
-    .from('memory_summary')
-    .select('*')
-    .eq('user_id', userId)
-    .order('updated_at', { ascending: false })
-    .limit(1)
-    .single();
-
-  if (error) {
-    // If no summary exists yet, return null instead of throwing an error
-    if (error.code === 'PGRST116') {
-      return null;
-    }
-    throw new Error(`Failed to fetch memory summary: ${error.message}`);
-  }
-
-  return data;
-}
-
-export async function saveMemorySummary(
-  userId: string,
-  content: string
-): Promise<MemorySummary> {
-  // Check if a summary already exists for this user
-  const { data: existingSummary, error: fetchError } = await supabase
-    .from('memory_summary')
-    .select('id')
-    .eq('user_id', userId)
-    .limit(1)
-    .single();
-
-  if (fetchError && fetchError.code !== 'PGRST116') {
-    throw new Error(`Failed to check for existing memory summary: ${fetchError.message}`);
-  }
-
-  let result;
-  if (existingSummary) {
-    // Update existing summary
-    const { data, error } = await supabase
-      .from('memory_summary')
-      .update({ content })
-      .eq('id', existingSummary.id)
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to update memory summary: ${error.message}`);
-    }
-    result = data;
-  } else {
-    // Create new summary
-    const { data, error } = await supabase
-      .from('memory_summary')
-      .insert([{ user_id: userId, content }])
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to create memory summary: ${error.message}`);
-    }
-    result = data;
-  }
-
-  return result;
-}
-
-export async function generateMemorySummary(messages: Message[]): Promise<string> {
-  if (messages.length === 0) {
-    return "No previous conversation history.";
-  }
-
-  // Create a conversation history string for summarization
-  const conversationText = messages
-    .map(msg => `${msg.role === 'user' ? 'User' : 'Elina'}: ${msg.content}`)
-    .join('\n');
-
-  // Generate a summary using HuggingFace
-  const summaryPrompt = `
-    <s>[INST] You are an AI assistant that summarizes conversations. Please provide a concise summary of the following conversation between a user and Elina (an AI assistant). Focus on key topics, user interests, and important information shared. This summary will be used as memory context for future conversations.
-
-    Conversation:
-    ${conversationText}
-    
-    Please summarize in a paragraph: [/INST]
-  `;
-
-  try {
-    const response = await hf.textGeneration({
-      model: 'mistralai/Mistral-7B-Instruct-v0.2',
-      inputs: summaryPrompt,
-      parameters: {
-        max_new_tokens: 150,
-        temperature: 0.3,
-        top_p: 0.9,
-      },
-    });
-
-    // Extract the summary from the response
-    let summary = response.generated_text;
-    const lastInstIndex = summary.lastIndexOf('[/INST]');
-    if (lastInstIndex !== -1) {
-      summary = summary.substring(lastInstIndex + 7).trim();
-    }
-    summary = summary.replace(/\[INST\]|\[\/INST\]/g, '').trim();
-
-    return summary;
-  } catch (error) {
-    console.error('Error generating summary:', error);
-    return "Failed to generate conversation summary.";
-  }
-}
-
-export async function checkAndSummarizeMemory(userId: string): Promise<void> {
-  try {
-    // Get message count for this user
-    const { count, error } = await supabase
-      .from('messages')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId);
-
-    if (error) {
-      throw new Error(`Failed to count messages: ${error.message}`);
-    }
-
-    // If we have enough messages, create or update a summary
-    if (count && count >= SUMMARIZE_THRESHOLD) {
-      // Get all messages except the most recent HISTORY_LIMIT
-      const { data: oldMessages, error: messagesError } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('user_id', userId)
-        .order('timestamp', { ascending: true })
-        .limit(count - HISTORY_LIMIT);
-
-      if (messagesError) {
-        throw new Error(`Failed to fetch old messages: ${messagesError.message}`);
-      }
-
-      if (oldMessages && oldMessages.length > 0) {
-        // Generate summary of old messages
-        const summary = await generateMemorySummary(oldMessages);
-        
-        // Save the summary
-        await saveMemorySummary(userId, summary);
-      }
-    }
-  } catch (error) {
-    console.error('Error in checkAndSummarizeMemory:', error);
-    // Don't throw here - this is a background operation that shouldn't break the main flow
-  }
-}
-
-export async function buildPromptWithHistory(
-  userId: string,
-  messages: Message[], 
-  newMessage: string, 
-  memorySummary?: string | null
-): Promise<string> {
-  // Get the user's custom personality if available
-  const personalityDescription = await getPersonalityDescription(userId);
-  
-  // Start with character system prompt
-  let prompt = `<s>[INST] ${personalityDescription} [/INST]\n\n`;
-
-  // Add memory summary if available
-  if (memorySummary) {
-    prompt += `[INST] Previous conversation summary: ${memorySummary} [/INST]\n\n`;
-  }
-
-  // Add conversation history
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role === 'user') {
-      prompt += `[INST] ${msg.content} [/INST]\n`;
-    } else {
-      prompt += `${msg.content}\n\n`;
-    }
-  }
-
-  // Add the new message
-  prompt += `[INST] ${newMessage} [/INST]`;
-
-  return prompt;
 }
 
 function filterUnexpectedContent(response: string): string {

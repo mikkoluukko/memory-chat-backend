@@ -1,9 +1,10 @@
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config(); // Loads .env by default - MUST be first
 
-import express, { Request, Response, RequestHandler } from 'express';
+import express from 'express';
 import cors from 'cors';
-import { HfInference } from '@huggingface/inference';
+
+import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { 
   getRecentMessages, 
   saveMessage, 
@@ -15,158 +16,137 @@ import {
   savePersonality 
 } from './services/personalityService';
 
+
+
+// If you have specific production/staging .env files, load them conditionally:
+// if (process.env.NODE_ENV === 'production') { 
+//   dotenv.config({ path: '.env.production', override: true });
+// } else if (process.env.NODE_ENV === 'staging') {
+//   dotenv.config({ path: '.env.staging', override: true });
+// }
+
 export const app = express();
 const port = process.env.PORT || 3001;
 
-// Initialize HuggingFace client
-const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
+// --- Gemini Client Initialization (Delayed) ---
+let genAI: GoogleGenerativeAI | null = null;
+let model: GenerativeModel | null = null;
 
+function initializeGeminiClient() {
+  if (!genAI) {
+    if (!process.env.GEMINI_API_KEY) {
+        throw new Error("GEMINI_API_KEY environment variable is not set.");
+    }
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    console.log("Gemini Client Initialized");
+  }
+  return { genAI, model };
+}
+// --- End Gemini Client Initialization ---
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-export function cleanModelResponse(response: string): string {
-  // Extract only the assistant's response by:
-  // 1. Remove everything up to the last [/INST] tag
-  // 2. Remove any remaining [INST] or [/INST] tags
-  // 3. Cut off response at first occurrence of markdown link or base64 data
-  const lastInstIndex = response.lastIndexOf('[/INST]');
-  if (lastInstIndex !== -1) {
-    response = response.substring(lastInstIndex + 7).trim();
-  }
-  
-  // Remove any remaining instruction tags
-  response = response.replace(/\[INST\]|\[\/INST\]/g, '').trim();
-  
-  // Cut off response at the first occurrence of a markdown link or unusual pattern
-  const markdownLinkIndex = response.indexOf('[');
-  if (markdownLinkIndex !== -1) {
-    response = response.substring(0, markdownLinkIndex).trim();
-  }
-  
-  return response;
-}
+// --- API Routes ---
 
-function filterUnexpectedContent(response: string): string {
-  // More aggressive cleaning of unwanted content:
-  // 1. Remove any content within square brackets followed by parentheses (markdown links)
-  response = response.replace(/\[.*?\]\(.*?\)/g, '');
-  
-  // 2. Remove any content containing base64 data
-  response = response.replace(/data:image\/[^"')\s]+/g, '');
-  
-  // 3. Remove any trailing square brackets that might be left
-  response = response.replace(/\[\s*\]/g, '');
-  
-  // 4. Clean up any double spaces and trim
-  return response.replace(/\s+/g, ' ').trim();
-}
+/**
+ * GET /api/personality
+ * Retrieves the personality setting for a user.
+ */
+app.get('/api/personality', async (req, res) => {
+  const userId = req.query.userId as string;
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required' });
+  }
 
-// Chat endpoint
-export const chatHandler: RequestHandler = async (req, res) => {
   try {
-    const { message, userId } = req.body;
+    const personality = await getPersonality(userId);
+    res.json({ personality });
+  } catch (error) {
+    console.error('Failed to get personality:', error);
+    res.status(500).json({ error: 'Failed to retrieve personality' });
+  }
+});
+
+/**
+ * POST /api/personality
+ * Saves or updates the personality setting for a user.
+ */
+app.post('/api/personality', async (req, res) => {
+  const { userId, description } = req.body;
+  if (!userId || typeof description !== 'string') {
+    return res.status(400).json({ error: 'User ID and description are required' });
+  }
+
+  try {
+    const savedPersonality = await savePersonality(userId, description);
+    res.json({ personality: savedPersonality });
+  } catch (error) {
+    console.error('Failed to save personality:', error);
+    res.status(500).json({ error: 'Failed to save personality' });
+  }
+});
+
+/**
+ * POST /api/chat/message
+ * Handles incoming chat messages, gets response from Gemini, and saves messages.
+ */
+export const chatHandler = async (req: express.Request, res: express.Response) => {
+  const { message, userId } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: 'Message is required' });
+  }
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required' });
+  }
+
+  try {
+    // Ensure Gemini client is initialized before handling the request
+    const { model: geminiModel } = initializeGeminiClient();
+    if (!geminiModel) { // Check if model is initialized
+      throw new Error('Gemini model failed to initialize.');
+    }
     
-    if (!message) {
-      res.status(400).json({ error: 'Message is required' });
-      return;
-    }
-
-    if (!userId) {
-      res.status(400).json({ error: 'User ID is required' });
-      return;
-    }
-
-    // Save user message
+    // 1. Save user message
     await saveMessage(userId, message, 'user');
 
-    // Get conversation history
-    const history = await getRecentMessages(userId);
-    
-    // Get memory summary if available
-    const memorySummary = await getMemorySummary(userId);
-    
-    // Build prompt with history, memory summary, and custom personality
-    const prompt = await buildPromptWithHistory(userId, history, message, memorySummary?.content);
+    // 2. Get recent messages
+    const recentMessages = await getRecentMessages(userId);
 
-    // Get AI response
-    const response = await hf.textGeneration({
-      model: 'mistralai/Mistral-7B-Instruct-v0.2',
-      inputs: prompt,
-      parameters: {
-        max_new_tokens: 100,
-        temperature: 0.3,
-        top_p: 0.85,
-        repetition_penalty: 1.2,
-      },
+    // 3. Build prompt for Gemini
+    const history = await buildPromptWithHistory(userId, recentMessages, message);
+
+    // 4. Get response from Gemini
+    const chat = geminiModel.startChat({
+      history,
     });
+    const result = await chat.sendMessage(message); 
+    const botResponseText = result.response.text();
 
-    const botResponse = filterUnexpectedContent(cleanModelResponse(response.generated_text));
+    // 5. Save bot response
+    await saveMessage(userId, botResponseText, 'model');
 
-    // Save bot response
-    await saveMessage(userId, botResponse, 'bot');
+    // 6. Send response back to client
+    res.json({ response: botResponseText });
 
-    res.json({ response: botResponse });
-  } catch (error) {
-    console.error('Error:', error);
+  } catch (error) { // Added type annotation for error
+    console.error('Error in chatHandler:', error instanceof Error ? error.message : error);
     res.status(500).json({ error: 'Failed to generate response' });
   }
 };
 
-// Get personality endpoint
-export const getPersonalityHandler: RequestHandler = async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId || typeof userId !== 'string') {
-      res.status(400).json({ error: 'User ID is required as a query parameter' });
-      return;
-    }
-
-    const personality = await getPersonality(userId);
-    
-    if (personality) {
-      res.json({ personality });
-    } else {
-      res.json({ personality: null });
-    }
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Failed to fetch personality' });
-  }
-};
-
-// Save personality endpoint
-export const savePersonalityHandler: RequestHandler = async (req, res) => {
-  try {
-    const { userId, description } = req.body;
-    
-    if (!userId) {
-      res.status(400).json({ error: 'User ID is required' });
-      return;
-    }
-
-    if (!description) {
-      res.status(400).json({ error: 'Personality description is required' });
-      return;
-    }
-
-    const personality = await savePersonality(userId, description);
-    
-    res.json({ personality });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Failed to save personality' });
-  }
-};
-
-// Register routes
 app.post('/api/chat/message', chatHandler);
-app.get('/api/personality', getPersonalityHandler);
-app.post('/api/personality', savePersonalityHandler);
 
-// Only start the server if we're not in a test environment
+// --- Server Start ---
+
+// Only start server if not in test environment
 if (process.env.NODE_ENV !== 'test') {
+  // Initialize client when server starts in non-test environments
+  initializeGeminiClient(); 
   app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`Backend server listening on port ${port}`);
   });
 } 
