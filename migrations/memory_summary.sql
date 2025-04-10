@@ -1,5 +1,5 @@
 -- Create memory_summary table for long-term conversation memory
-CREATE TABLE IF NOT EXISTS memory_summary (
+CREATE TABLE public.memory_summary (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id TEXT NOT NULL,
   content TEXT NOT NULL,
@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS memory_summary (
 );
 
 -- Add comment to the table
-COMMENT ON TABLE memory_summary IS 'Stores summarized conversation history for users'; 
+COMMENT ON TABLE public.memory_summary IS 'Stores summarized conversation history for users';

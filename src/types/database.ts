@@ -26,6 +26,13 @@ export interface Personality {
   updated_at: string;
 }
 
+export interface SalientMemory {
+  id: string;
+  user_id: string;
+  content: string;
+  timestamp: string;
+}
+
 export interface Database {
   public: {
     Tables: {
@@ -43,6 +50,11 @@ export interface Database {
         Row: Personality;
         Insert: Omit<Personality, 'id' | 'created_at' | 'updated_at'>;
         Update: Partial<Omit<Personality, 'id' | 'created_at' | 'updated_at'>>;
+      };
+      salient_memories: {
+        Row: SalientMemory;
+        Insert: Omit<SalientMemory, 'id' | 'timestamp'>;
+        Update: Partial<Omit<SalientMemory, 'id' | 'timestamp'>>;
       };
     };
   };
